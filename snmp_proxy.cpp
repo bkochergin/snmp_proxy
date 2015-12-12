@@ -39,6 +39,7 @@ static const std::string kSNMPv2cVersion = "\x02\x01\x01";
 static const uint8_t kGetRequestPDUType = 0xa0;
 static const uint8_t kGetNextRequestPDUType = 0xa1;
 static const uint8_t kGetResponsePDUType = 0xa2;
+static const uint8_t kGetBulkRequestPDUType = 0xa5;
 
 SNMPProxy::SNMPProxy(uint16_t port, const std::string& backend_community,
                      std::time_t cache_ttl) :
@@ -68,7 +69,8 @@ bool SNMPProxy::Start() {
 
     if (!snmp_sequence.initialized() ||
         (snmp_sequence.pdu_type() != kGetRequestPDUType &&
-         snmp_sequence.pdu_type() != kGetNextRequestPDUType)) {
+         snmp_sequence.pdu_type() != kGetNextRequestPDUType &&
+         snmp_sequence.pdu_type() != kGetBulkRequestPDUType)) {
       continue;
     }
 
@@ -140,7 +142,7 @@ SNMPProxy::SNMPSequence::SNMPSequence(const char* start, const char* end) :
   }
   pdu_type_ = *start;
   if (pdu_type_ != kGetRequestPDUType && pdu_type_ != kGetNextRequestPDUType &&
-      pdu_type_ != kGetResponsePDUType) {
+      pdu_type_ != kGetResponsePDUType && pdu_type_ != kGetBulkRequestPDUType) {
     return;
   }
 
