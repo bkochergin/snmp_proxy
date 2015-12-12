@@ -24,9 +24,9 @@
 
 #include <cstdint>
 #include <ctime>
-#include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
@@ -47,6 +47,7 @@ class SNMPProxy {
 
     bool initialized() const;
     const std::string& community() const;
+    const std::string& community_index() const;
     uint8_t pdu_type() const;
     uint32_t request_id() const;
     const std::string& data() const;
@@ -63,6 +64,7 @@ class SNMPProxy {
     bool initialized_;
     uint64_t length_;
     std::string community_;
+    std::string community_index_;
     uint8_t pdu_type_;
     uint64_t pdu_length_;
     uint32_t request_id_;
@@ -74,20 +76,27 @@ class SNMPProxy {
     static uint8_t DecodeASN1Int(const char* start, const char* end,
                                  uint64_t* result);
 
-    // Encodes an integer into ASN.1 BER-encoded short-form or long-form
+    // Encodes an integer into an ASN.1 BER-encoded short-form or long-form
     // integer.
     static std::string EncodeASN1Int(uint64_t input);
   };
 
   class CacheKey {
    public:
-    CacheKey(const std::string& backend_host, uint8_t request_type,
-             const std::string& request_data);
+    CacheKey(const std::string& backend_host,
+             const std::string& community, const std::string& community_index,
+             uint8_t request_type, const std::string& request_data);
 
-    bool operator<(const CacheKey& other) const;
+    bool operator==(const CacheKey& other) const;
+
+    struct Hash {
+      size_t operator()(const CacheKey& cache_key) const;
+    };
 
    private:
     const std::string backend_host_;
+    const std::string community_;
+    const std::string community_index_;
     const uint8_t request_type_;
     const std::string request_data_;
   };
@@ -108,7 +117,7 @@ class SNMPProxy {
   boost::asio::io_service io_service_;
   const uint16_t port_;
   const time_t cache_ttl_;
-  std::map<CacheKey, CacheValue> cache_;
+  std::unordered_map<CacheKey, CacheValue, CacheKey::Hash> cache_;
   std::mutex mutex_;
 
   std::string GetResponse(const std::string& backend_host,

@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <thread>
 
@@ -75,8 +76,8 @@ bool SNMPProxy::Start() {
     }
 
     std::cout << "Got SNMPv2c request from " << remote_endpoint
-              << " (community=" << snmp_sequence.community() << ")."
-              << std::endl;
+              << " (community=" << snmp_sequence.community()
+              << snmp_sequence.community_index() << ")." << std::endl;
 
     if (error && error != boost::asio::error::message_size) {
       throw boost::system::system_error(error);
@@ -84,7 +85,8 @@ bool SNMPProxy::Start() {
 
     boost::system::error_code ignored_error;
     const std::string backend_host = snmp_sequence.community();
-    snmp_sequence.set_community(backend_community_);
+    snmp_sequence.set_community(backend_community_ +
+                                snmp_sequence.community_index());
     socket.send_to(
         boost::asio::buffer(GetResponse(backend_host, snmp_sequence)),
         remote_endpoint, 0, ignored_error);
@@ -135,6 +137,14 @@ SNMPProxy::SNMPSequence::SNMPSequence(const char* start, const char* end) :
   }
   community_.assign(start, community_length);
 
+  // Parse out community index.
+  const size_t community_index_pos_ = community_.find('@');
+  if (community_index_pos_ != std::string::npos) {
+    community_index_ = community_.substr(community_index_pos_);
+    community_.resize(community_index_pos_);
+    length_ -= community_index_.size();
+  }
+
   // PDU type (GetRequest, GetNextRequest, or GetResponse).
   start += community_length;
   if (start + 5 > end) {
@@ -177,6 +187,10 @@ bool SNMPProxy::SNMPSequence::initialized() const {
 
 const std::string& SNMPProxy::SNMPSequence::community() const {
   return community_;
+}
+
+const std::string& SNMPProxy::SNMPSequence::community_index() const {
+  return community_index_;
 }
 
 uint8_t SNMPProxy::SNMPSequence::pdu_type() const {
@@ -266,18 +280,28 @@ std::string SNMPProxy::SNMPSequence::EncodeASN1Int(uint64_t input) {
 }
 
 SNMPProxy::CacheKey::CacheKey(const std::string& backend_host,
+                              const std::string& community,
+                              const std::string& community_index,
                               uint8_t request_type,
                               const std::string& request_data) :
-    backend_host_(backend_host), request_type_(request_type),
+    backend_host_(backend_host), community_(community),
+    community_index_(community_index), request_type_(request_type),
     request_data_(request_data) {}
 
-bool SNMPProxy::CacheKey::operator<(const CacheKey& other) const {
-  return (backend_host_ < other.backend_host_) ||
-         (backend_host_ == other.backend_host_ &&
-          request_type_ < other.request_type_) ||
-         (backend_host_ == other.backend_host_ &&
+bool SNMPProxy::CacheKey::operator==(const CacheKey& other) const {
+  return (backend_host_ == other.backend_host_ &&
+          community_ == other.community_ &&
+          community_index_ == other.community_index_ &&
           request_type_ == other.request_type_ &&
-          request_data_ < other.request_data_);
+          request_data_ == other.request_data_);
+}
+
+size_t SNMPProxy::CacheKey::Hash::operator()(const CacheKey& key) const {
+  return (std::hash<std::string>()(key.backend_host_) ^ 
+          std::hash<std::string>()(key.community_) ^
+          std::hash<std::string>()(key.community_index_) ^
+          std::hash<uint8_t>()(key.request_type_) ^
+          std::hash<std::string>()(key.request_data_));
 }
 
 SNMPProxy::CacheValue::CacheValue() {}
@@ -295,7 +319,9 @@ const std::string& SNMPProxy::CacheValue::response_data() const {
 
 std::string SNMPProxy::GetResponse(const std::string& backend_host,
                                    const SNMPSequence& snmp_request) {
-  CacheKey key(backend_host, snmp_request.pdu_type(), snmp_request.data());
+  CacheKey key(backend_host, snmp_request.community(),
+               snmp_request.community_index(), snmp_request.pdu_type(),
+               snmp_request.data());
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto cache_entry = cache_.find(key);
