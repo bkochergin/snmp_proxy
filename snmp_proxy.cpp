@@ -145,7 +145,7 @@ SNMPProxy::SNMPSequence::SNMPSequence(const char* start, const char* end) :
     length_ -= community_index_.size();
   }
 
-  // PDU type (GetRequest, GetNextRequest, or GetResponse).
+  // PDU type (GetRequest, GetNextRequest, GetResponse, or GetBulkRequest).
   start += community_length;
   if (start + 5 > end) {
     return;
