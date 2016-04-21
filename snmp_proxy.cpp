@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Boris Kochergin. All rights reserved.
+ * Copyright 2016 Boris Kochergin. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -30,6 +30,7 @@
 
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
+#include <boost/bind.hpp>
 
 #include "snmp_proxy.h"
 
@@ -41,11 +42,15 @@ static const uint8_t kGetRequestPDUType = 0xa0;
 static const uint8_t kGetNextRequestPDUType = 0xa1;
 static const uint8_t kGetResponsePDUType = 0xa2;
 static const uint8_t kGetBulkRequestPDUType = 0xa5;
+static const uint8_t kResourceUnavailableError = 0xd;
 
 SNMPProxy::SNMPProxy(uint16_t port, const std::string& backend_community,
-                     std::time_t cache_ttl) :
-    backend_community_(backend_community), port_(port), cache_ttl_(cache_ttl) {}
-
+                     std::time_t backend_timeout_sec,
+                     unsigned int num_backend_retries,
+                     std::time_t cache_ttl_sec) :
+    port_(port), backend_community_(backend_community),
+    backend_timeout_sec_(backend_timeout_sec),
+    num_backend_retries_(num_backend_retries), cache_ttl_sec_(cache_ttl_sec) {}
 
 bool SNMPProxy::Start() {
   udp::socket socket(io_service_);
@@ -215,6 +220,10 @@ void SNMPProxy::SNMPSequence::set_pdu_type(uint8_t pdu_type) {
   pdu_type_ = pdu_type;
 }
 
+void SNMPProxy::SNMPSequence::set_error(uint8_t error) {
+  data_[2] = error;
+}
+
 void SNMPProxy::SNMPSequence::set_data(const std::string& data) {
   length_ -= (data_.size() + EncodeASN1Int(pdu_length_).size() - 1);
   length_ += data.size();
@@ -317,6 +326,21 @@ const std::string& SNMPProxy::CacheValue::response_data() const {
   return response_data_;
 }
 
+void SNMPProxy::TimeoutRead(boost::asio::ip::udp::socket& socket,
+                            std::condition_variable* cv) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (cv->wait_for(lock, std::chrono::seconds(backend_timeout_sec_))) {
+    socket.cancel();
+  }
+}
+
+void SNMPProxy::Read(size_t bytes_transferred, size_t* response_size,
+                     std::condition_variable* cv) {
+  *response_size = bytes_transferred;
+  std::unique_lock<std::mutex> lock(mutex_);
+  cv->notify_all();
+}
+
 std::string SNMPProxy::GetResponse(const std::string& backend_host,
                                    const SNMPSequence& snmp_request) {
   CacheKey key(backend_host, snmp_request.community(),
@@ -327,7 +351,7 @@ std::string SNMPProxy::GetResponse(const std::string& backend_host,
     auto cache_entry = cache_.find(key);
     if (cache_entry != cache_.end()) {
       // Stale cache entry. Evict it and fall through to the backend.
-      if (std::time(nullptr) > cache_entry->second.time() + cache_ttl_) {
+      if (std::time(nullptr) > cache_entry->second.time() + cache_ttl_sec_) {
         cache_.erase(cache_entry);
       } else {
         // Fresh cache entry. Serve it.
@@ -344,19 +368,51 @@ std::string SNMPProxy::GetResponse(const std::string& backend_host,
   udp::endpoint remote_endpoint = *resolver.resolve(query);
   udp::socket socket(io_service_);
   socket.open(udp::v4());
-  socket.send_to(boost::asio::buffer(snmp_request.Serialize()),
-                                     remote_endpoint);
+
+  unsigned int num_retries = 0;
   boost::array<char, 65536> response;
   udp::endpoint local_endpoint;
-  size_t response_size =
-      socket.receive_from(boost::asio::buffer(response), local_endpoint);
-  SNMPSequence snmp_response(response.data(), response.data() + response_size);
-  if (snmp_response.initialized()) {
+  size_t response_size = 0;
+  do {
+    io_service_.reset();
+    socket.send_to(boost::asio::buffer(snmp_request.Serialize()),
+                                       remote_endpoint);
+    std::condition_variable cv;
+    std::thread read_timeout_thread(
+        std::bind(&SNMPProxy::TimeoutRead, this, boost::ref(socket), &cv));
+    socket.async_receive_from(
+        boost::asio::buffer(response), local_endpoint,
+        boost::bind(&SNMPProxy::Read, this,
+                    boost::asio::placeholders::bytes_transferred,
+                    &response_size, &cv));
+    io_service_.run();
+    read_timeout_thread.join();
+    ++num_retries;
+  } while (num_retries <= num_backend_retries_ && response_size == 0);
+
+  // We didn't get a response. Cache and serve an unavailable error.
+  if (response_size == 0) {
+    std::cerr << "Timeout while querying " << backend_host << "." << std::endl;
+    SNMPSequence snmp_response(snmp_request);
+    snmp_response.set_community(backend_host);
+    snmp_response.set_pdu_type(kGetResponsePDUType);
+    snmp_response.set_error(kResourceUnavailableError);
     std::lock_guard<std::mutex> lock(mutex_);
     cache_[key] = CacheValue(snmp_response.data());
     snmp_response.set_community(backend_host);
     return snmp_response.Serialize();
+  } else {
+    // We got a response we could parse. Cache it and serve it.
+    SNMPSequence snmp_response(response.data(),
+                               response.data() + response_size);
+    if (snmp_response.initialized()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cache_[key] = CacheValue(snmp_response.data());
+      snmp_response.set_community(backend_host);
+      return snmp_response.Serialize();
+    }
   }
+  // We got a response we couldn't parse. Serve it.
   return std::string(response.data(), response_size);
 }
 
@@ -367,7 +423,7 @@ void SNMPProxy::EvictStaleCacheEntries() {
       std::lock_guard<std::mutex> lock(mutex_);
       const std::time_t current_time = std::time(nullptr);
       for (auto entry = cache_.begin(); entry != cache_.end();) {
-        if (current_time > entry->second.time() + cache_ttl_) {
+        if (current_time > entry->second.time() + cache_ttl_sec_) {
           entry = cache_.erase(entry);
           ++num_evicted_entries;
         } else {
@@ -379,6 +435,6 @@ void SNMPProxy::EvictStaleCacheEntries() {
       std::cout << "Evicted " << num_evicted_entries << " stale cache entries."
                 << std::endl;
     }
-    std::this_thread::sleep_for(std::chrono::seconds(cache_ttl_));
+    std::this_thread::sleep_for(std::chrono::seconds(cache_ttl_sec_));
   }
 }

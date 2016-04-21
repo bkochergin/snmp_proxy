@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Boris Kochergin. All rights reserved.
+ * Copyright 2016 Boris Kochergin. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -29,7 +29,9 @@
 int main(int argc, char* argv[]) {
   uint16_t port;
   std::string backend_community;
-  std::time_t cache_ttl;
+  std::time_t backend_timeout_sec;
+  unsigned int num_backend_retries;
+  std::time_t cache_ttl_sec;
   boost::program_options::options_description description("Available options");
   description.add_options()
       ("help", "print available options")
@@ -39,8 +41,16 @@ int main(int argc, char* argv[]) {
       ("backend_community",
        boost::program_options::value<std::string>(&backend_community),
        "set community to query on backend devices")
-      ("cache_ttl",
-       boost::program_options::value<std::time_t>(&cache_ttl)->
+      ("backend_timeout_sec",
+       boost::program_options::value<std::time_t>(&backend_timeout_sec)->
+           default_value(2),
+       "set timeout, in seconds, for querying backends")
+      ("num_backend_retries",
+       boost::program_options::value<unsigned int>(&num_backend_retries)->
+           default_value(2),
+       "set number of retries for querying backends")
+      ("cache_ttl_sec",
+       boost::program_options::value<std::time_t>(&cache_ttl_sec)->
            default_value(300),
        "set time-to-live, in seconds, for cache entries");
   boost::program_options::variables_map variables_map;
@@ -54,7 +64,8 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  SNMPProxy snmp_proxy(port, backend_community, cache_ttl);
+  SNMPProxy snmp_proxy(port, backend_community, backend_timeout_sec,
+                       num_backend_retries, cache_ttl_sec);
   if (!snmp_proxy.Start()) {
     return 1;
   }
